@@ -1,3 +1,335 @@
+「あとから失敗したログのみを抽出したい」という目的がある場合、現在の**「`request_id`のみをキーにする」設計だけでは不十分**です。
+
+DynamoDBで「特定のステータス（FAILEDなど）」を条件に検索する場合、そのままではテーブル全件を調べる「Scan」という非常に効率の悪い（料金が高い）操作が必要になってしまいます。
+
+これを解決するために、**GSI（グローバルセカンダリインデックス）**という「別窓口」を設ける設計にするのがベストです。
+
+---
+
+### 1. 修正後のテーブル設計（GSIの導入）
+
+*   **メインのキー（Partition Key）**: `request_id`
+    *   用途：特定の処理の詳細をパッと見たいとき。
+*   **追加のインデックス（GSI）**:
+    *   **GSIのPartition Key**: `status` （SUCCESS, FAILED など）
+    *   **GSIのSort Key**: `timestamp` （いつ起きたか）
+    *   **用途**: 「失敗（FAILED）したものを、新しい順に並べて取得したい」ときに使用。
+
+---
+
+### 2. CDKでの設定変更
+
+CDKでテーブルを作成した後に、インデックス（GSI）を追加するコードを加えます。
+
+```typescript
+const logTable = new dynamodb.Table(this, 'ProcessLogTable', {
+  partitionKey: { name: 'request_id', type: dynamodb.AttributeType.STRING },
+  billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+  timeToLiveAttribute: 'ttl',
+  removalPolicy: cdk.RemovalPolicy.DESTROY,
+});
+
+// ★GSI（追加インデックス）の作成
+logTable.addGlobalSecondaryIndex({
+  indexName: 'StatusIndex', // インデックスの名前
+  partitionKey: { name: 'status', type: dynamodb.AttributeType.STRING }, // 検索条件
+  sortKey: { name: 'timestamp', type: dynamodb.AttributeType.STRING },    // 並び順用
+  projectionType: dynamodb.ProjectionType.ALL, // 全データを含める
+});
+```
+
+---
+
+### 3. Pythonでの「失敗ログのみ取得」のコード
+
+データを取得する際、`table.scan` ではなく **`table.query`** を使います。これが圧倒的に速くて安いです。
+
+```python
+from boto3.dynamodb.conditions import Key
+
+def get_failed_logs():
+    """失敗したログを最新順に取得する"""
+    response = table.query(
+        IndexName='StatusIndex', # CDKで決めたインデックス名
+        KeyConditionExpression=Key('status').eq('FAILED'), # statusがFAILEDのものだけ
+        ScanIndexForward=False # Falseにすると降順（新しい順）になる
+    )
+    return response.get('Items', [])
+
+# 使い方
+failed_items = get_failed_logs()
+for item in failed_items:
+    print(f"Failed ID: {item['request_id']}, Error: {item['details']}")
+```
+
+---
+
+### 4. なぜこの設計にする必要があるのか？（Scan vs Query）
+
+DynamoDBを触る上で一番重要な違いです。
+
+*   **Scan（悪い例）**: 
+    *   テーブルにある100万件のログを、AWSが全部1枚ずつめくって「FAILED」を探します。
+    *   **デメリット**: 100万件分の読取料金がかかり、時間もかかります。
+*   **Query（良い例 / GSI使用）**: 
+    *   「FAILED」というラベルが貼られた引き出しだけを直接開けます。
+    *   **メリット**: 該当する件数分しか料金がかからず、一瞬で終わります。
+
+### まとめ：明日からの設計方針
+
+1.  **書き込み時**: 今まで通り `request_id` と `status`, `timestamp` を含めて保存するだけでOKです（DynamoDBが勝手にインデックスを更新してくれます）。
+2.  **読み込み時**: 
+    *   IDで検索するときはメインのテーブルから。
+    *   「失敗のみ」「成功のみ」を一覧したいときは **`StatusIndex`** から。
+
+この「GSI」という仕組みさえ入れておけば、後から「昨日1日の失敗ログだけCSVで出して」と言われても、数行のコードで対応できるようになります！
+
+
+DynamoDBのテーブル作成、特にCDKでの設定において「これだけは知っておくべき」ポイントを整理しました。
+
+「オンデマンド課金」と「プロビジョニング課金」の違い、およびログテーブルとしての「ベストな設定」を解説します。
+
+---
+
+### 1. 「オンデマンド課金」とは？（初心者への推奨）
+
+DynamoDBには2つの支払いモードがあります。
+
+*   **オンデマンド (PAY_PER_REQUEST)**
+    *   **内容**: 「1回書き込んだら○円」「1回読み込んだら○円」という従量課金。
+    *   **メリット**: 使わなければ **0円** です。また、急にアクセスが増えてもAWSが勝手に処理能力を上げてくれます。
+    *   **ベストな選択**: 開発中や、今回のシステムのように「いつ、どのくらいの頻度で実行されるか読めない」場合は、**これ一択**です。
+*   **プロビジョニング (PROVISIONED)**
+    *   **内容**: 「1秒間に○回読み書きする枠」を事前に予約して月額を払う。
+    *   **メリット**: 24時間常に大量のアクセスがある場合、オンデマンドより安くなる。
+    *   **デメリット**: 枠を使い切るとエラー（スロットリング）になり、使っていなくても予約料金が発生する。
+
+---
+
+### 2. CDKで設定すべき「4つの重要項目」
+
+ログテーブルとして運用する場合、以下の設定を強く推奨します。
+
+#### ① RemovalPolicy（削除ポリシー）
+*   **設定**: `cdk.RemovalPolicy.DESTROY` (開発) / `RETAIN` (本番)
+*   **注意点**: CDKでは、デフォルトで「スタックを削除してもテーブルはAWSに残る」ようになっています。開発中に何度も作り直すなら `DESTROY` にしないと、AWSにゴミ（空のテーブル）が溜まってしまいます。
+
+#### ② TTL (Time to Live)
+*   **設定**: `timeToLiveAttribute: 'ttl'`
+*   **重要性**: ログは放っておくと無限に溜まり、ストレージ料金がかさみます。TTLを設定すると、指定した日時（Unixタイムスタンプ）を過ぎたデータを **AWSが無料で自動削除** してくれます。
+
+#### ③ Point-in-Time Recovery (PITR)
+*   **設定**: `pointInTimeRecovery: true`
+*   **内容**: 過去35日間のどの時点の状態にもテーブルを復元できる機能。
+*   **重要性**: 誤ってデータを消してしまった時の保険です。本番環境では必須です。
+
+#### ④ Partition Key（パーティションキー）の設計
+*   **設定**: `request_id` などの一意のID。
+*   **内容**: DynamoDBはキーによる検索は高速ですが、キー以外での検索（例：特定の日付範囲を全部探す）は苦手で料金も高くつきます。
+
+---
+
+### 3. 【結論】これが「ログ用DynamoDB」のベストなCDKコード
+
+これまでの内容を反映した、最もメンテナンス性が高くコスト効率の良いコードです。
+
+```typescript
+const logTable = new dynamodb.Table(this, 'ProcessLogTable', {
+  // 1. パーティションキー（一意のID）
+  partitionKey: { name: 'request_id', type: dynamodb.AttributeType.STRING },
+
+  // 2. オンデマンド課金（使った分だけ、開発時はほぼ0円）
+  billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+
+  // 3. 自動削除の設定（有効期限が来たら勝手に消える）
+  timeToLiveAttribute: 'ttl',
+
+  // 4. バックアップ（誤削除対策：本番はtrue、開発ならfalseでも可）
+  pointInTimeRecovery: true,
+
+  // 5. 削除設定（CDKスタックを消した時にテーブルも一緒に消す設定）
+  // 本番環境では .RETAIN に書き換えること！
+  removalPolicy: cdk.RemovalPolicy.DESTROY,
+});
+```
+
+---
+
+### 💡 運用上のアドバイス：Python側でのTTLの書き方
+
+テーブル作成時に `timeToLiveAttribute: 'ttl'` を指定した場合、Pythonコード側で「いつ消すか」を指定する必要があります。
+
+```python
+import time
+
+# ログ保存時
+item = {
+    'request_id': 'abc-123',
+    'status': 'SUCCESS',
+    # 現在時刻 + 604800秒（7日間）の数値をセット
+    'ttl': int(time.time()) + (7 * 24 * 60 * 60) 
+}
+table.put_item(Item=item)
+```
+
+これをやっておくだけで、**「ログが溜まりすぎて数ヶ月後に高額請求が来る」というクラウドの失敗談を確実に回避**できます。
+
+明日の仕事では、まず「オンデマンド」でテーブルを作り、TTLを有効にするところから始めてみてください。
+@@---------------------------------------------------
+
+システム全体の可観測性（トレース）を高めるために、DynamoDBへのログ記録は非常に良い選択です。処理ごとの固有ID（`request_id`）をキーにすることで、後から「あの時、何が起きたか」を即座に特定できるようになります。
+
+以下の3つの構成でコードを提示します。
+
+1.  **【CDK】** DynamoDBテーブルの作成とLambdaへの権限付与
+2.  **【Python】** DynamoDBへのログ書き込み・読み込みのサンプル
+3.  **【Python】** `lambda_handler` への組み込み例
+
+---
+
+### 1. CDKコード (TypeScript)
+DynamoDBテーブルを定義し、Lambda関数がそのテーブルを操作できるように権限を渡します。
+
+```typescript
+import * as cdk from 'aws-cdk-lib';
+import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
+import * as lambda from 'aws-cdk-lib/aws-lambda';
+import { Construct } from 'constructs';
+
+export class MyStack extends cdk.Stack {
+  constructor(scope: Construct, id: string, props?: cdk.StackProps) {
+    super(scope, id, props);
+
+    // 1. DynamoDBテーブルの作成
+    const logTable = new dynamodb.Table(this, 'ProcessLogTable', {
+      partitionKey: { name: 'request_id', type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST, // オンデマンド課金
+      removalPolicy: cdk.RemovalPolicy.DESTROY, // スタック削除時にテーブルも削除（開発用）
+      timeToLiveAttribute: 'ttl', // 期限切れログを自動削除する場合
+    });
+
+    // 2. Lambda関数の定義（既存のものがある場合は読み替え）
+    const myLambda = new lambda.Function(this, 'MyLambda', {
+      // ... 他の設定 ...
+      environment: {
+        TABLE_NAME: logTable.tableName,
+      },
+    });
+
+    // 3. Lambdaに読み書き権限を付与
+    logTable.grantReadWriteData(myLambda);
+  }
+}
+```
+
+---
+
+### 2. Pythonコード (DynamoDB操作)
+`boto3` ライブラリを使用して読み書きを行います。
+
+```python
+import boto3
+import os
+import time
+from botocore.exceptions import ClientError
+
+# 環境変数からテーブル名を取得
+TABLE_NAME = os.environ.get('TABLE_NAME')
+dynamodb = boto3.resource('dynamodb')
+table = dynamodb.Table(TABLE_NAME)
+
+def save_log(request_id, status, details):
+    """ログを書き込む (PutItem)"""
+    try:
+        table.put_item(
+            Item={
+                'request_id': request_id,
+                'timestamp': str(time.time()),
+                'status': status,
+                'details': details,
+                'ttl': int(time.time()) + (7 * 24 * 60 * 60) # 7日後に自動削除
+            }
+        )
+    except ClientError as e:
+        print(f"DynamoDB Error: {e.response['Error']['Message']}")
+
+def get_log(request_id):
+    """ログを読み込む (GetItem)"""
+    try:
+        response = table.get_item(Key={'request_id': request_id})
+        return response.get('Item')
+    except ClientError as e:
+        print(f"DynamoDB Error: {e.response['Error']['Message']}")
+        return None
+```
+
+---
+
+### 3. Lambdaへの組み込み例
+`context.aws_request_id` を固有IDとして使うのが一般的です。
+
+```python
+import json
+import uuid
+
+def lambda_handler(event, context):
+    # AWSが発行する一意のIDを取得（またはC#側から送られたID）
+    request_id = context.aws_request_id 
+    
+    # 1. 開始ログ
+    save_log(request_id, "STARTED", {"event": event})
+
+    try:
+        # --- ここで決済や画像生成の処理を行う ---
+        # 成功したとする
+        result_urls = ["https://example.com/1.jpg"]
+        
+        # 2. 完了ログ
+        save_log(request_id, "SUCCESS", {"urls": result_urls})
+        
+        return {
+            'statusCode': 200,
+            'body': json.dumps({'request_id': request_id, 'urls': result_urls})
+        }
+
+    except Exception as e:
+        # 3. エラーログ
+        save_log(request_id, "FAILED", {"error": str(e)})
+        raise e
+```
+
+---
+
+### 💡 明日の作業へのアドバイス
+
+#### ログに何を書くべきか？
+DynamoDBには「後で調査が必要な情報」を絞って書くのがコツです。
+*   **Prompt**: どんな指示で画像が生成されたか。
+*   **Model**: どのモデルを使ったか。
+*   **Error Message**: 失敗時、APIが何と言ってきたか。
+*   **Execution Time**: 処理に何秒かかったか。
+
+#### テスト時の注意
+DynamoDBへの書き込みも、テストコード（`test_app.py`）ではモック化する必要があります。
+
+```python
+# test_app.py での追加例
+@patch('app.table.put_item')
+def test_handler_with_logging(mock_put):
+    # 実行
+    app.lambda_handler({...}, mock_context)
+    
+    # DynamoDBにログを書こうとしたか確認
+    assert mock_put.called
+```
+
+#### なぜDynamoDBか？
+CloudWatch Logsでもログは見れますが、DynamoDBに保存しておくと、**「C#側から `request_id` を投げて、現在の処理ステータスを確認するAPI」** を将来的に作るのが非常に簡単になります。
+
+これで、インフラ（CDK）、サーバー（Python）、クライアント（C#）、呼び出し元（C++）の全ての層がつながる準備が整いました！
+
+@@---------------------------------------------------
+
 Python側のテストコードは、このプロジェクトの**「品質の要」**です。
 外部API（fal.ai）や決済システム（payment）に実際につなぐことなく、あらゆる状況をシミュレーションするためのコードを整理して再提示します。
 
@@ -289,6 +621,7 @@ static void Main(string[] args) {
 これで C++ ↔ C# ↔ Lambda ↔ fal.ai の全経路が繋がります！
 ---
 
+@@---------------------------------------------------
 ### Pythonテストのポイントまとめ（明日への備忘録）
 
 1.  **`patch('app.xxxx')` の書き方**
@@ -300,8 +633,6 @@ static void Main(string[] args) {
     *   ただ呼ばれただけでなく、**「意図した引数（トークンや枚数）」**で呼ばれたかを必ずチェックする。これがバグを未然に防ぎます。
 
 このテストコードがしっかりしていれば、C#やC++側で多少変更があっても、Python側のロジックが壊れていないことを一瞬で確認できます。
-
-@@---------------------------------------------------
 
 @@---------------------------------------------------
 まとめ２ 自動リトライでも失敗したらどうするのか
@@ -650,3 +981,4 @@ async function handlePayment(event) {
 
 
 この「第2の壁」さえ実装すれば、Lambdaがどのタイミングで爆発しようとも、二重課金は確実に防げます。使用している決済サービスのAPIドキュメントで「Idempotency Keys（冪等性キー）」の項目を必ず確認してください。
+
