@@ -1,3 +1,308 @@
+Python側のテストコードは、このプロジェクトの**「品質の要」**です。
+外部API（fal.ai）や決済システム（payment）に実際につなぐことなく、あらゆる状況をシミュレーションするためのコードを整理して再提示します。
+
+---
+
+### テスト対象のコード (`app.py`)
+まず、テストされる側のコードがこちらです。
+
+```python
+import fal_client
+import payment
+from concurrent.futures import ThreadPoolExecutor
+
+def generate_single(model_id, prompt):
+    # 1枚生成してURLを返す
+    res = fal_client.subscribe(model_id, arguments={"prompt": prompt})
+    return res['images'][0]['url']
+
+def lambda_handler(event, context):
+    try:
+        token = event.get('one_time_token')
+        model_id = event.get('model_name', 'fal-ai/flux/dev')
+        prompt = event.get('prompt')
+        count = max(1, min(event.get('image_count', 1), 4))
+
+        # 1. 決済チェック
+        if payment.request(token) != 200:
+            return {'status_code': 402, 'image_urls': []}
+
+        # 2. 並列画像生成
+        with ThreadPoolExecutor(max_workers=count) as executor:
+            futures = [executor.submit(generate_single, model_id, prompt) for _ in range(count)]
+            urls = [f.result() for f in futures]
+
+        return {'status_code': 200, 'image_urls': urls}
+    except Exception as e:
+        return {'status_code': 500, 'message': str(e)}
+```
+
+---
+
+### テストコード (`test_app.py`)
+
+ここからが本題のテストコードです。`pytest` で実行することを想定しています。
+
+#### 1. 正常系テスト（複数枚・動的モデル指定）
+一番メインとなる「正しく動くはず」のケースです。
+
+```python
+from unittest.mock import patch, ANY
+import app
+
+def test_success_multiple_images():
+    # payment.request と fal_client.subscribe を両方モック化
+    with patch('app.payment.request') as mock_pay, \
+         patch('app.fal_client.subscribe') as mock_fal:
+        
+        # 【準備】成功時の戻り値を設定
+        mock_pay.return_value = 200
+        mock_fal.return_value = {'images': [{'url': 'http://fake.jpg'}]}
+        
+        # 【実行】
+        event = {
+            'one_time_token': 'tok_123',
+            'model_name': 'fal-ai/nano-banana-pro',
+            'prompt': 'cyberpunk city',
+            'image_count': 3
+        }
+        result = app.lambda_handler(event, {})
+        
+        # 【検証】
+        assert result['status_code'] == 200
+        assert len(result['image_urls']) == 3
+        # 正しいモデル名で呼ばれたか確認
+        assert mock_fal.call_args.args[0] == 'fal-ai/nano-banana-pro'
+```
+
+#### 2. セキュリティ・引数検証テスト
+**「正しいトークンが決済システムに渡されているか」**を確認します。非常に重要です。
+
+```python
+def test_argument_integrity():
+    with patch('app.payment.request') as mock_pay, \
+         patch('app.fal_client.subscribe') as mock_fal:
+        
+        mock_pay.return_value = 200
+        mock_fal.return_value = {'images': [{'url': 'http://ok.jpg'}]}
+        
+        token = 'STRICT_CONFIDENTIAL_TOKEN'
+        app.lambda_handler({'one_time_token': token, 'prompt': 'test'}, {})
+        
+        # 【検証】決済関数が「このトークン」で「1回だけ」呼ばれたことを保証
+        mock_pay.assert_called_once_with(token)
+```
+
+#### 3. 異常系テスト（APIがエラーを返した場合）
+「カード残高不足」などで決済APIが402を返してきた状況をシミュレーションします。
+
+```python
+def test_payment_failed():
+    with patch('app.payment.request') as mock_pay:
+        # 【準備】決済失敗(402)を返すように設定
+        mock_pay.return_value = 402
+        
+        result = app.lambda_handler({'one_time_token': 'bad_token'}, {})
+        
+        # 【検証】
+        assert result['status_code'] == 402
+        assert result['image_urls'] == [] # 画像生成は行われない
+```
+
+#### 4. 異常系テスト（通信事故・例外発生）
+ネットワークが切れるなどの「事故」を `side_effect` で再現します。
+
+```python
+def test_network_exception():
+    with patch('app.payment.request') as mock_pay:
+        # 【準備】関数が呼ばれたら例外(Exception)を投げるように設定
+        mock_pay.side_effect = Exception("Connection Timeout")
+        
+        result = app.lambda_handler({'one_time_token': 'tok_123'}, {})
+        
+        # 【検証】
+        assert result['status_code'] == 500
+        assert "Connection Timeout" in result['message']
+```
+C++側のコードを「何をしているか」がひと目でわかるようにモック化・関数化して整理しました。
+
+実務でよく使われる**JSONライブラリ（nlohmann/json）**を想定したパース処理も組み込んでいます。このライブラリはヘッダーのみで使用でき、非常に一般的です。
+
+### 整理されたC++コード
+
+```cpp
+#include <windows.h>
+#include <iostream>
+#include <string>
+#include <vector>
+#include <memory>
+
+// JSONパース用ライブラリ (nlohmann/json を想定)
+// ※導入していない場合は文字列のまま扱ってください
+// #include <nlohmann/json.hpp> 
+// using json = nlohmann::json;
+
+// 結果を格納する構造体
+struct ExeResult {
+    int exitCode;
+    std::string output; // JSON文字列
+};
+
+// --- 内部関数: パイプから全出力を読み取る ---
+std::string ReadPipeToString(HANDLE hPipe) {
+    std::string result;
+    CHAR chBuf[4096];
+    DWORD dwRead;
+
+    // パイプが空になるまで読み続ける
+    while (ReadFile(hPipe, chBuf, sizeof(chBuf) - 1, &dwRead, NULL) && dwRead > 0) {
+        chBuf[dwRead] = '\0';
+        result += chBuf;
+    }
+    return result;
+}
+
+// --- 内部関数: プロセスを実行し出力をキャプチャする ---
+ExeResult ExecuteProcess(const std::wstring& cmd) {
+    ExeResult result = { -1, "" };
+
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+    HANDLE hStdOutRead, hStdOutWrite;
+
+    // 1. パイプ作成
+    if (!CreatePipe(&hStdOutRead, &hStdOutWrite, &sa, 0)) return result;
+    SetHandleInformation(hStdOutRead, HANDLE_FLAG_INHERIT, 0);
+
+    // 2. スタートアップ情報の設定
+    STARTUPINFOW si = { sizeof(si) };
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = hStdOutWrite;
+    si.hStdError = hStdOutWrite; // エラーも同じパイプに流す
+
+    PROCESS_INFORMATION pi = { 0 };
+    std::vector<wchar_t> cmdBuf(cmd.begin(), cmd.end());
+    cmdBuf.push_back(0);
+
+    // 3. プロセス起動
+    if (CreateProcessW(NULL, cmdBuf.data(), NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
+        // 【重要】書き込み用ハンドルは親側では不要なので即閉じる
+        // これをしないとReadFileが「まだ書き込まれるかも」と待ち続けて終わらない
+        CloseHandle(hStdOutWrite);
+
+        // 4. 出力の読み取り
+        result.output = ReadPipeToString(hStdOutRead);
+
+        // 5. 終了待機と終了コードの取得
+        WaitForSingleObject(pi.hProcess, INFINITE);
+        DWORD exitCode;
+        GetExitCodeProcess(pi.hProcess, &exitCode);
+        result.exitCode = (int)exitCode;
+
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+    } else {
+        CloseHandle(hStdOutWrite);
+    }
+
+    CloseHandle(hStdOutRead);
+    return result;
+}
+
+// --- メイン関数: C#側を呼び出してJSONを得る ---
+std::string GetJsonFromCSharp(const std::wstring& exePath, const std::wstring& args) {
+    std::wstring commandLine = L"\"" + exePath + L"\" " + args;
+    
+    std::wcout << L"実行中: " << commandLine << std::endl;
+    ExeResult res = ExecuteProcess(commandLine);
+
+    if (res.exitCode != 0) {
+        std::cerr << "C# EXEがエラーを返しました。Code: " << res.exitCode << std::endl;
+        // エラー時は空のJSONやエラー用JSONを返す
+        return "{}";
+    }
+
+    return res.output;
+}
+
+// --- JSONパースの例 ---
+void ParseAndDisplay(const std::string& jsonStr) {
+    if (jsonStr.empty() || jsonStr == "{}") return;
+
+    std::cout << "\n--- 解析結果 ---" << std::endl;
+    
+    /* 
+    // nlohmann/json を使う場合の例:
+    try {
+        auto data = json::parse(jsonStr);
+        std::string status = data["status"];
+        std::cout << "Status: " << status << std::endl;
+        for (auto& url : data["image_urls"]) {
+            std::cout << "URL: " << url << std::endl;
+        }
+    } catch (json::parse_error& e) {
+        std::cerr << "JSONパース失敗: " << e.what() << std::endl;
+    }
+    */
+
+    // ライブラリがない場合の簡易表示
+    std::cout << jsonStr << std::endl;
+}
+
+int main() {
+    // 実際の設定に合わせて変更してください
+    std::wstring exePath = L"PaymentApp.exe";
+    std::wstring args = L"tok_test_12345 fal-ai/flux/dev 4";
+
+    // 1. 実行してJSON文字列を取得
+    std::string jsonResponse = GetJsonFromCSharp(exePath, args);
+
+    // 2. パースして表示
+    ParseAndDisplay(jsonResponse);
+
+    return 0;
+}
+```
+
+### 改善のポイント
+
+1.  **`ExeResult` 構造体の導入**:
+    単なる文字列だけでなく、`exitCode`（終了コード）もセットで返すようにしました。これにより、「プログラム自体がクラッシュしたのか」「中身が空だったのか」を区別できます。
+2.  **`ReadPipeToString` の分離**:
+    パイプからの読み取りロジックを独立させたことで、`ExecuteProcess` 関数がすっきりしました。
+3.  **`CloseHandle(hStdOutWrite)` のタイミング**:
+    `CreateProcess` 成功直後に親プロセス側の書き込みハンドルを閉じています。これはパイプ通信における**鉄則**で、これを忘れると「C#側は終わっているのに、C++側が読み取りを完了できない（フリーズする）」というデッドロックが発生します。
+4.  **JSONパースの関数化**:
+    `ParseAndDisplay` として分離しました。実際の開発では、ここに `nlohmann/json` などのライブラリを入れるのがベストです。
+
+### 明日からの進め方のアドバイス
+
+C++側でこの関数が完成したら、まずはC#側で以下のような **「テスト用のダミー出力だけするEXE」** を作って連携を確認してください。
+
+```csharp
+// C#側のテスト用メイン関数
+static void Main(string[] args) {
+    // 実際の通信をせずに、決められたJSONを出すだけ
+    Console.WriteLine("{\"status\":\"success\", \"image_urls\":[\"http://test1.jpg\", \"http://test2.jpg\"]}");
+}
+```
+
+これで C++ ↔ C# ↔ Lambda ↔ fal.ai の全経路が繋がります！
+---
+
+### Pythonテストのポイントまとめ（明日への備忘録）
+
+1.  **`patch('app.xxxx')` の書き方**
+    *   `fal_client` を直接パッチするのではなく、**`app.py` がインポートしている `app.fal_client`** をパッチするのがコツです。
+2.  **`return_value` vs `side_effect`**
+    *   `return_value`: 「402」や「JSON」など、**特定の値**を返したいとき。
+    *   `side_effect`: **「エラー（例外）」**を発生させたいときや、呼ぶたびに戻り値を変えたいとき。
+3.  **検証は `assert_called_once_with`**
+    *   ただ呼ばれただけでなく、**「意図した引数（トークンや枚数）」**で呼ばれたかを必ずチェックする。これがバグを未然に防ぎます。
+
+このテストコードがしっかりしていれば、C#やC++側で多少変更があっても、Python側のロジックが壊れていないことを一瞬で確認できます。
+
+@@---------------------------------------------------
+
 @@---------------------------------------------------
 まとめ２ 自動リトライでも失敗したらどうするのか
 
@@ -342,5 +647,6 @@ async function handlePayment(event) {
     *   **目的：** すでに完了しているのにStripeのAPIを叩きに行くと通信時間が無駄なので、Lambdaレベルで即レスするためのキャッシュ的な役割。
 2.  **第2の壁（決済プロバイダー）：** `Idempotency Key` を指定してAPIを叩く。
     *   **目的：** **Lambdaが途中終了してリトライが発生した際の、真の二重課金防止策。**
+
 
 この「第2の壁」さえ実装すれば、Lambdaがどのタイミングで爆発しようとも、二重課金は確実に防げます。使用している決済サービスのAPIドキュメントで「Idempotency Keys（冪等性キー）」の項目を必ず確認してください。
