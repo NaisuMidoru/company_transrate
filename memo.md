@@ -1151,3 +1151,194 @@ async function handlePayment(event) {
 3.  **集計:** 取得したレコードの `Amount` を合計する。
     *   ※件数が多い場合は、DynamoDBからS3へエクスポートし、Amazon Athena (SQL) で集計することを推奨。
 
+@@----0222
+
+### Step 1: アップロードURL発行時（並列処理の準備）
+
+このタイミングで「今回は何枚処理するか」を宣言してしまいます。
+
+**何を書き込むか (`UPDATE`)**:
+* `status`: `URL_ISSUED`
+* `total_items`: `3` （今回処理する枚数）
+* `processed_items`: `0`
+
+---
+
+### Step 3: 画像生成処理（複数Lambdaが並列実行）
+
+ここが最重要ポイントです。3つのLambdaが同時にDynamoDBを更新しにいく可能性があるため、**「条件付き更新（Conditional Update）」と「ADD演算子」**を使って、競合を防ぎつつカウントアップしていきます。
+
+#### ① 各Lambdaの開始時
+各Lambdaは開始時に `status` を無理に更新する必要はありません（3つ同時に走るため意味が薄いため）。 もし書くとしたら、CloudWatch ログの方に `transaction_id` と `image_id` をつけて開始ログを出すだけで十分です。
+
+#### ② 各Lambdaの完了時（画像1枚出力ごとに実行）
+画像の生成とS3への保存が終わったLambdaから順番に、以下のようにDynamoDBを更新します。
+
+**何を書き込むか (`UpdateItem` 式)**:
+1. `processed_items` を `+1` する（`ADD` 演算子を使用）
+   ※ 単なる上書きではなく「現在の値に1を足す」というアトミック操作にすることで、複数Lambdaが同時更新しても正確にカウントされます。
+2. `detail` に生成した画像のS3キーを追記する。
+
+**同時に「すべて完了したか」を判定する**:
+DynamoDBの `UpdateItem` リクエストは、「更新後の最新のレコード情報 (`ReturnValues="ALL_NEW"`)」 を返すことができます。 Lambda内でこの返り値を受け取り、以下の判定を行います。
+
+```python
+# 疑似コード
+if updated_record['processed_items'] >= updated_record['total_items']:
+    # ★ このLambdaが「最後の1枚」を完了させた！
+    # status を PROCESSED に更新する
+    update_status(transaction_id, 'PROCESSED')
+```
+
+---
+
+### 結果としてどうなるか？
+
+* **Lambda A が完了**: `processed_items` が `1` になる。（`1 >= 3` は `False` なので何もしない）
+* **Lambda B が完了**: `processed_items` が `2` になる。（`2 >= 3` は `False` なので何もしない）
+* **Lambda C が完了**: `processed_items` が `3` になる。
+  **「3（完了） >= 3（合計）」になったので、このLambda Cが代表して `status` を `PROCESSED`（生成完了・課金待ち）に更新する！**
+
+---
+
+### なぜこの設計が良いのか？
+
+1. **競合（レースコンディション）が起きない**: 
+   DynamoDBの `ADD` を使うため、同時にLambdaが完了してもカウントがずれません。
+2. **状態が明確になる**: 
+   異常検知バッチを回したときに、「`status` はまだ `PROCESSED` になっていないが、`processed_items` は `2/3` で止まっているな」といった途中経過でのスタックダウンも詳細に把握できるようになります。
+3. **Step4以降に影響を与えない**: 
+   クライアントや課金Lambdaから見れば、最終的に `status` が `PROCESSED` になったことだけを確認すればよく、裏側が並列処理である複雑さを隠蔽できます。
+
+```python
+import boto3
+from botocore.exceptions import ClientError
+
+dynamodb = boto3.resource('dynamodb')
+table = dynamodb.Table('TransactionStateTable')
+
+def complete_image_generation(transaction_id: str, output_s3_key: str):
+    """
+    画像生成が1枚終わるごとに呼ばれる処理。
+    自身をカウントアップし、「最後の1人」であれば全体ステータスを完了にする。
+    """
+    try:
+        # 1. 自身の完了をアトミックに加算 (+1) する
+        update_response = table.update_item(
+            Key={'transaction_id': transaction_id},
+            # SET ではなく ADD を使い、processed_items に :inc(つまり1) を足す
+            # 完了したS3キーもリスト(またはセット)に追加しておく設計例
+            UpdateExpression="ADD processed_items :inc SET detail.output_keys = list_append(if_not_exists(detail.output_keys, :empty_list), :new_key)",
+            ExpressionAttributeValues={
+                ':inc': 1,
+                ':empty_list': [],
+                ':new_key': [output_s3_key]
+            },
+            # ★重要★ 更新【後】の最新の全カラムデータを返してもらう
+            ReturnValues="ALL_NEW"
+        )
+        
+        # 2. 戻り値から、加算後の最新の数字を取り出す
+        updated_record = update_response.get('Attributes', {})
+        total = updated_record.get('total_items', 1) # Null対策
+        processed = updated_record.get('processed_items', 0)
+        
+        print(f"Transaction: {transaction_id} - 進捗: {processed} / {total}")
+        
+        # 3. 自分が「最後の1人」だった場合の追加処理
+        if processed >= total:
+            print("すべての画像生成が完了しました。ステータスをPROCESSEDに更新します。")
+            mark_transaction_as_processed(transaction_id)
+            
+    except ClientError as e:
+        print(f"DynamoDB更新エラー: {e}")
+        # 実際はここにエラー時のERRORステータス更新処理などを入れる
+        raise
+
+def mark_transaction_as_processed(transaction_id: str):
+    """
+    全体のステータスを「生成完了（PROCESSED）」に進める処理
+    """
+    table.update_item(
+        Key={'transaction_id': transaction_id},
+        UpdateExpression="SET #s = :status",
+        ExpressionAttributeNames={
+            '#s': 'status' # statusは予約語なのでエスケープ
+        },
+        ExpressionAttributeValues={
+            ':status': 'PROCESSED'
+        }
+    )
+
+# ---------
+# 実行イメージ
+# ---------
+# Lambdaが処理を終えた最後に以下を実行
+# complete_image_generation("tx-uuid-1234", "s3://my-bucket/outputs/image_2.jpg")
+
+```
+このコードのポイント（解説）
+アトミックカウンター (ADD processed_items :inc) プログラム側で processed = current + 1 のような計算や読み込み（GetItem）を一切行っていません。DynamoDBのエンジン側に「今の数字に 1 を足して」とだけ伝えています。これにより、他Lambdaとの競合（レースコンディション）が絶対に起きません。
+ReturnValues="ALL_NEW" を使う 足し算をした結果、DBの中に入っている数字が「今いくつになったのか」を、別通信で読み込み直すことなく、この戻り値で正確に知ることができます。
+最後に自分が引導を渡す (if processed >= total:) 戻り値を見て、「あっ、自分の＋1のせいで、processed が total と同じ数字になったぞ！」と気づいたLambdaだけが、後段の mark_transaction_as_processed()（全体ステータスの更新）を呼び出します。（他の2つのLambdaは 1/3, 2/3 なのでこのif文に入らず、そのまま静かに終了します）。
+この一連のシンプルなロジックだけで、並列分散システムにおける「処理の待ち合わせ（Join）」を安全かつ完璧に実装できます。
+
+### 各ステップで何をログに出すべきか
+
+**【Step 0】 残高確認Lambda**
+* **INFO**: リクエスト受信（ユーザーID、リクエストされた枚数などを記録）
+* **INFO**: 課金システムAPIへのリクエスト開始（`/api/v1/balance` 等の叩く先のURLを出す）
+* **INFO**: 課金システムAPIからのレスポンス受信（HTTPステータスコード 200 や、確保した金額）
+* **ERROR**: （万が一）残高不足だった場合の内容
+* **INFO**: `transaction_id` の新規発行完了ログ
+
+**【Step 1】 URL発行Lambda**
+* **INFO**: URL発行リクエスト受信
+* **INFO**: S3のPresigned URLをX件発行したという完了報告と、発行したS3キー（`inputs/tx-123.jpg`など）。※実際の長いURL文字列自体は出さなくてよい。
+
+**【Step 3】 画像生成Lambda（※並列で走る一番重要な箇所）**
+ここには処理の過程を細かく残します。万が一落ちたときに、自側（Lambda）の原因か、他側（fal.ai）の原因かを切り分けるためです。
+* **INFO**: 処理開始（「3枚中X枚目の処理を開始します」など）
+* **INFO**: fal.ai へのリクエスト送信（使用するモデル名、リクエストのパラメータ）
+* **WARN/INFO**: fal.aiからの完了待ち（ポーリングしているなら「X秒待機中…」など）
+* **INFO**: fal.ai からの生成成功レスポンス（取得できた画像URLなど）
+* **ERROR**: fal.ai からの500エラーやタイムアウト時（返ってきたRawエラーメッセージをそのまま `detail` に突っ込む）
+* **INFO**: S3への画像ダウンロード＆再アップロード完了（保存先のS3キー）
+* **INFO**: DynamoDBへのアトミックカウントアップ(ADD)の実行結果（「現在 2/3完了」などの戻り値）
+
+**【Step 5】 課金処理Lambda**
+* **INFO**: 課金リクエスト受信（S3からのダウンロードが完了した報告）
+* **INFO**: 自社課金システムへの本決済リクエスト送信
+* **INFO**: 決済成功レスポンス（領収IDなど）
+* **ERROR**: 決済システム側がダウンしている場合のエラー詳細
+
+---
+
+### なぜこのフォーマット（JSON + Transaction ID）で書くのか？
+
+万が一、DynamoDBの監視バッチで「`tx-123` が Step3プロセスの途中でスタックして何時間も止まっている」というアラートがSlackに飛んできたとします。
+
+運用担当者（あなた）は AWS コンソールを開き、CloudWatch Logs Insights の画面で以下のクエリを1行叩くだけで済みます。
+
+```text
+fields @timestamp, step, level, message, detail.error_reason
+| filter transaction_id = "tx-123"
+| sort @timestamp asc
+```
+
+すると、以下のような時系列ストーリーが全Lambdaの垣根を越えて一瞬で表示されます。
+
+```text
+18:00:00 [Step0] 残高確保しました（500円）
+18:00:01 [Step1] S3アップロードURLを発行しました
+18:00:10 [Step3] fal.aiへリクエストを開始（1枚目）
+18:00:10 [Step3] fal.aiへリクエストを開始（2枚目）
+18:00:12 [Step3] fal.aiへリクエストを開始（3枚目）
+18:00:15 [Step3] 1枚目完了、S3へアップロード成功
+18:00:18 [Step3] 3枚目完了、S3へアップロード成功
+18:01:40 [Step3] ERROR: 2枚目のfal.aiリクエストがHTTP 504 Gateway Timeoutで失敗しました
+```
+
+「ああ、2枚目の画像生成の時にfal.ai側がタイムアウトしてエラー落ちしたせいで、DynamoDBのアトミックカウンターが3/3に到達せず、全体がスタックしていたんだな」 という原因が秒速で特定できます。
+
+このように、**「DynamoDBで『誰が止まっているか』を見つけ、CloudWatchで『なぜ止まったか』を調べる」**という分業が、このアーキテクチャの監視における最大のベストプラクティスです。
